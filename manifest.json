@@ -1,0 +1,7 @@
+{
+    "name": "Magic Cloak",
+    "version": "1.0",
+    "description": "Эффект плаща невидимки",
+    "permissions": ["camera"],
+    "orientation": "landscape"
+}

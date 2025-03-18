@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Magic Cloak</title>
+    <style>
+        body {
+            margin: 0;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        #video-container {
+            position: relative;
+            width: 100%;
+            height: 100vh;
+        }
+        #video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div id="video-container">
+        <video id="video" autoplay></video>
+        <div id="controls">
+            <button onclick="toggleCamera()">🔄 Перезапустить</button>
+        </div>
+    </div>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script>
+        let stream;
+        let canvas;
+        let ctx;
+        let background;
+        let isBackgroundCaptured = false;
+
+        async function init() {
+            Telegram.WebApp.ready();
+            Telegram.WebApp.expand();
+            Telegram.WebApp.lockOrientation('landscape');
+            
+            stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            document.getElementById('video').srcObject = stream;
+            
+            canvas = document.createElement('canvas');
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            ctx = canvas.getContext('2d');
+            
+            setTimeout(() => {
+                captureBackground();
+                processVideo();
+            }, 3000);
+        }
+
+        function captureBackground() {
+            ctx.drawImage(document.getElementById('video'), 0, 0);
+            background = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            isBackgroundCaptured = true;
+        }
+
+        function processVideo() {
+            if (!isBackgroundCaptured) return;
+            
+            ctx.drawImage(document.getElementById('video'), 0, 0);
+            let src = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            
+            let hsv = convertToHSV(src.data);
+            const colorRanges = [
+                [[0, 100, 50], [8, 255, 255]],
+                [[170, 100, 50], [180, 255, 255]],
+                [[9, 100, 50], [25, 255, 255]],
+                [[26, 100, 50], [35, 255, 255]],
+                [[36, 100, 50], [60, 255, 255]],
+                [[61, 150, 70], [75, 255, 255]],
+                [[76, 50, 30], [85, 150, 150]],
+                [[86, 100, 50], [100, 255, 255]],
+                [[101, 100, 50], [130, 255, 255]],
+                [[131, 100, 50], [169, 255, 255]],
+                [[10, 50, 30], [25, 150, 150]],
+                [[0, 0, 0], [180, 255, 30]]
+            ];
+            
+            let combinedMask = new Uint8Array(hsv.length);
+            
+            colorRanges.forEach(([lower, upper]) => {
+                let mask = new Uint8Array(hsv.length);
+                for (let i = 0; i < hsv.length; i += 4) {
+                    let h = hsv[i];
+                    let s = hsv[i+1];
+                    let v = hsv[i+2];
+                    
+                    if (h >= lower[0] && h <= upper[0] &&
+                        s >= lower[1] && s <= upper[1] &&
+                        v >= lower[2] && v <= upper[2]) {
+                        mask[i] = 255;
+                    }
+                }
+                for (let i = 0; i < hsv.length; i += 4) {
+                    combinedMask[i] = Math.max(combinedMask[i], mask[i]);
+                }
+            });
+
+            let personMask = new Uint8Array(hsv.length);
+            let gray = new Uint8Array(hsv.length);
+            for (let i = 0; i < hsv.length; i += 4) {
+                gray[i] = hsv[i+2]; // Y (brightness)
+            }
+            
+            for (let i = 0; i < gray.length; i += 4) {
+                gray[i] = gray[i] > 60 ? 255 : 0;
+            }
+            
+            let contours = findContours(gray);
+            
+            contours.forEach(contour => {
+                contour.forEach(point => {
+                    let x = point[0];
+                    let y = point[1];
+                    let index = (y * canvas.width + x) * 4;
+                    personMask[index] = 255;
+                });
+            });
+
+            for (let i = 0; i < hsv.length; i += 4) {
+                combinedMask[i] = combinedMask[i] * (255 - personMask[i]);
+            }
+
+            combinedMask = applyMorphology(combinedMask, 7, 2);
+
+            let dst = new Uint8ClampedArray(src.length);
+            for (let i = 0; i < src.length; i += 4) {
+                let mask = combinedMask[i];
+                dst[i] = src[i] * (255 - mask) + background.data[i] * mask;
+                dst[i+1] = src[i+1] * (255 - mask) + background.data[i+1] * mask;
+                dst[i+2] = src[i+2] * (255 - mask) + background.data[i+2] * mask;
+                dst[i+3] = src[i+3];
+            }
+
+            ctx.putImageData(new ImageData(dst, canvas.width, canvas.height), 0, 0);
+            
+            requestAnimationFrame(processVideo);
+        }
+
+        function convertToHSV(data) {
+            let hsv = new Uint8Array(data.length);
+            for (let i = 0; i < data.length; i += 4) {
+                let r = data[i];
+                let g = data[i+1];
+                let b = data[i+2];
+                
+                let max = Math.max(r, g, b);
+                let min = Math.min(r, g, b);
+                let delta = max - min;
+                
+                let h = 0;
+                let s = 0;
+                let v = max;
+                
+                if (delta !== 0) {
+                    s = delta / max;
+                    if (r === max) h = (g - b) / delta;
+                    else if (g === max) h = 2 + (b - r) / delta;
+                    else h = 4 + (r - g) / delta;
+                    h *= 60;
+                    if (h < 0) h += 360;
+                }
+                
+                hsv[i] = Math.floor(h);
+                hsv[i+1] = Math.floor(s * 255);
+                hsv[i+2] = Math.floor(v);
+                hsv[i+3] = data[i+3];
+            }
+            return hsv;
+        }
+
+        function applyMorphology(mask, kernelSize, iterations) {
+            let kernel = new Array(kernelSize).fill(0).map(() => new Array(kernelSize).fill(1));
+            let newMask = new Uint8Array(mask.length);
+            
+            // Закрытие
+            for (let i = 0; i < iterations; i++) {
+                newMask = applyKernel(mask, kernel);
+                mask = newMask;
+            }
+            
+            // Открытие
+            for (let i = 0; i < iterations; i++) {
+                newMask = applyKernel(mask, kernel);
+                mask = newMask;
+            }
+            
+            // Дилатация
+            for (let i = 0; i < iterations; i++) {
+                newMask = applyKernel(mask, kernel);
+                mask = newMask;
+            }
+            
+            return mask;
+        }
+
+        function applyKernel(mask, kernel) {
+            let newMask = new Uint8Array(mask.length);
+            for (let y = 0; y < canvas.height; y++) {
+                for (let x = 0; x < canvas.width; x++) {
+                    let sum = 0;
+                    for (let ky = 0; ky < kernel.length; ky++) {
+                        for (let kx = 0; kx < kernel[ky].length; kx++) {
+                            let nx = x + kx - Math.floor(kernel[ky].length/2);
+                            let ny = y + ky - Math.floor(kernel.length/2);
+                            if (nx >= 0 && nx < canvas.width && ny >= 0 && ny < canvas.height) {
+                                sum += mask[(ny * canvas.width + nx) * 4] * kernel[ky][kx];
+                            }
+                        }
+                    }
+                    newMask[(y * canvas.width + x) * 4] = sum > 128 ? 255 : 0;
+                }
+            }
+            return newMask;
+        }
+
+        function findContours(gray) {
+            let contours = [];
+            let visited = new Array(gray.length).fill(false);
+            
+            for (let y = 0; y < canvas.height; y++) {
+                for (let x = 0; x < canvas.width; x++) {
+                    let index = (y * canvas.width + x) * 4;
+                    if (!visited[index] && gray[index] === 255) {
+                        let contour = [];
+                        floodFill(gray, visited, index, contour);
+                        if (contour.length > 10000) {
+                            contours.push(contour);
+                        }
+                    }
+                }
+            }
+            return contours;
+        }
+
+        function floodFill(gray, visited, start, contour) {
+            let stack = [start];
+            while (stack.length > 0) {
+                let index = stack.pop();
+                let x = (index / 4) % canvas.width;
+                let y = Math.floor(index / 4 / canvas.width);
+                
+                if (!visited[index]) {
+                    visited[index] = true;
+                    contour.push([x, y]);
+                    
+                    // Проверка соседей
+                    for (let dx = -1; dx <= 1; dx++) {
+                        for (let dy = -1; dy <= 1; dy++) {
+                            let nx = x + dx;
+                            let ny = y + dy;
+                            if (nx >= 0 && nx < canvas.width && ny >= 0 && ny < canvas.height) {
+                                let nindex = (ny * canvas.width + nx) * 4;
+                                if (!visited[nindex] && gray[nindex] === 255) {
+                                    stack.push(nindex);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Запуск приложения
+        init();
+    </script>
+</body>
+</html>
